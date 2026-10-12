@@ -1,0 +1,30 @@
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+/build
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+.dev.vars
+!.env.example
+!.env.test
+
+# 生成物（scripts/gen-redirects.ts）
+/_redirects
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Claude Code のローカルな設計メモ・設定
+/.claude/
