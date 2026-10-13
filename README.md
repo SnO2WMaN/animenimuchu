@@ -4,7 +4,7 @@ Annict と AniList の視聴状況をユーザーと作品のグラフで可視�
 
 ## Usage
 
-`/?user=annict:tosuke,annict:rinsuki,anilist:sno2wman`
+`/?user=anilist:sno2wman,annict:tosuke,annict:rinsuki`
 
 ## Development
 
@@ -14,6 +14,11 @@ echo 'ANNICT_ACCESS_TOKEN=...' > .env
 bun run dev
 ```
 
+## License
+
+[MIT License](./LICENSE)
+
 ## Naming
 
 [ローヤル202 - アニメに夢中 (sm44920756)](https://www.nicovideo.jp/watch/sm44920756)
+
