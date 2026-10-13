@@ -1,14 +1,14 @@
 import type { Service } from '#lib/query.ts';
-import type { Anime, Dataset, FetchResult, Status, User } from '#lib/types.ts';
+import { mergeResults } from '#lib/graph-data.ts';
+import type { Dataset } from '#lib/types.ts';
 import {
 	applyMirrored,
-	fillCovers,
+	fillCoversFromCache,
 	listMirrored,
-	scheduleMirror,
 	type CoverCache,
 	type CoverStore
 } from './covers.ts';
-import { fetchFromAnilist, fetchFromAnnict } from './sources.ts';
+import { fetchFromAnnict } from './sources.ts';
 
 /** 1 サービスあたりに受け付けるユーザー数の上限 */
 export const MAX_USERS_PER_SERVICE = 30;
@@ -53,86 +53,24 @@ export const groupByService = (
 });
 
 /**
- * 複数サービスの取得結果を 1 つのグラフにまとめる．
- * 同じ作品は ID（主に MAL の ID）で同一視し，先に出てきた方のタイトルを使う．
- * 画像とリンクは，先に出てきたものが null なら後から来たもので補う（リンクはキーごと）．
- * 同じユーザー・作品の組に複数の状態があれば WATCHING を優先する．
+ * Annict のユーザーの視聴状況を取得し，キャッシュ（D1・R2）の内容で画像とリンクを補う．
+ * AniList には接続しない（AniList の API はブラウザから呼ぶ）．AniList のユーザーは無視する．
  */
-export const mergeResults = (results: FetchResult[]): Dataset => {
-	const users = new Map<string, User>();
-	const animes = new Map<string, Anime>();
-	const statuses = new Map<string, Status>();
-
-	for (const r of results) {
-		for (const u of r.users) if (!users.has(u.id)) users.set(u.id, u);
-		for (const a of r.animes) {
-			const prev = animes.get(a.id);
-			if (!prev) animes.set(a.id, a);
-			else
-				animes.set(a.id, {
-					...prev,
-					imageUrl: prev.imageUrl ?? a.imageUrl,
-					links: {
-						annict: prev.links.annict ?? a.links.annict,
-						anilist: prev.links.anilist ?? a.links.anilist,
-						mal: prev.links.mal ?? a.links.mal
-					}
-				});
-		}
-		for (const s of r.statuses) {
-			const key = `${s.userId}\u0000${s.animeId}`;
-			const prev = statuses.get(key);
-			if (!prev || (prev.status === 'WATCHED' && s.status === 'WATCHING')) statuses.set(key, s);
-		}
-	}
-
-	const userSize = new Map<string, number>();
-	const animeSize = new Map<string, number>();
-	for (const { userId, animeId } of statuses.values()) {
-		userSize.set(userId, (userSize.get(userId) ?? 0) + 1);
-		animeSize.set(animeId, (animeSize.get(animeId) ?? 0) + 1);
-	}
-
-	return {
-		users: [...users.values()].map((u) => ({ ...u, size: userSize.get(u.id) ?? 0 })),
-		animes: [...animes.values()].map((a) => ({ ...a, size: animeSize.get(a.id) ?? 0 })),
-		statuses: [...statuses.values()],
-		errors: results.flatMap((r) => r.errors)
-	};
-};
-
 export const fetchGraph = async (
-	params: { annict: string[]; anilist: string[] },
+	params: { annict: string[] },
 	options: {
 		annictToken: string | undefined;
 		fetch?: typeof fetch;
 		cache?: CoverCache;
 		mirror?: { store: CoverStore };
-		waitUntil?: (p: Promise<unknown>) => void;
 	}
 ): Promise<Dataset> => {
-	// Annict の方がタイトルが日本語で揃っているので先に並べる．
-	const results = await Promise.all([
-		fetchFromAnnict(params.annict, options.annictToken, options.fetch),
-		fetchFromAnilist(params.anilist, options.fetch)
+	const merged = mergeResults([
+		await fetchFromAnnict(params.annict, options.annictToken, options.fetch)
 	]);
-	const merged = mergeResults(results);
-	const { mirror } = options;
-	// ミラー済みの作品は先に R2 の URL に置き換える（AniList の逆引き対象が減り，API が失敗しても表示できる）．
-	const keys = mirror ? await listMirrored(mirror.store) : new Set<string>();
-	const mirrored = mirror ? applyMirrored(merged, keys) : merged;
-	// 画像の無い MAL ID 付きの作品は AniList から逆引きする（失敗してもグラフ本体は返す）．
-	const filled = await fillCovers(mirrored, {
-		cache: options.cache,
-		fetch: options.fetch,
-		waitUntil: options.waitUntil
-	});
-	// 未ミラーのものを背景で R2 にコピーする．
-	if (mirror)
-		await scheduleMirror(filled, keys, {
-			store: mirror.store,
-			fetch: options.fetch,
-			waitUntil: options.waitUntil
-		});
-	return filled;
+	// ミラー済みの作品は R2 の URL に置き換える．
+	const keys = options.mirror ? await listMirrored(options.mirror.store) : new Set<string>();
+	const mirrored = options.mirror ? applyMirrored(merged, keys) : merged;
+	// D1 のキャッシュにある画像とリンクを補う（読み取りのみ）．
+	return fillCoversFromCache(mirrored, options.cache);
 };

@@ -1,15 +1,39 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
+	import { browser } from '$app/env';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 
 	import DetailPanel from '#lib/components/DetailPanel.svelte';
 	import Graph from '#lib/components/Graph.svelte';
+	import { anilistUsersOf, loadFullDataset, postCoverReports } from '#lib/graph-data.ts';
 	import { trackShown } from '#lib/panel.ts';
 	import { buildQuery, copyText, prettifyQuery, type Service } from '#lib/query.ts';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
+
+	// AniList の API はブラウザから呼ぶので，完全なデータセットはクライアントでだけ作る．
+	// SSR とハイドレーションの出力を揃えるため，マウント後に作り始める（それまでは「読み込み中…」）．
+	let mounted = $state(false);
+	$effect(() => {
+		mounted = true;
+	});
+
+	// data（ユーザー指定）が変わるたびに作り直す．古い Promise の結果は {#await} が無視する．
+	const full = $derived.by(() => {
+		if (!browser || !mounted || data.users.length === 0) return null;
+		const { dataset: serverData, users } = data;
+		return (async () => {
+			const server = serverData ? await serverData : null;
+			const { dataset, reports } = await loadFullDataset({
+				server,
+				anilistUsers: anilistUsersOf(users)
+			});
+			if (reports.length > 0) void postCoverReports(reports);
+			return dataset;
+		})();
+	});
 
 	let focused = $state<string | null>(null);
 	// パネルに渡す ID．focused が外れても，パネルへ移動する間は少し残す．
@@ -115,8 +139,15 @@
 </svelte:head>
 
 <main class="relative h-dvh w-full overflow-hidden bg-zinc-50 text-zinc-900">
-	{#if data.dataset}
-		{#await data.dataset}
+	{#if data.users.length === 0}
+		<div class="flex h-full items-center justify-center text-zinc-500">
+			<p>
+				ユーザーを指定してください．例:
+				<a href={EXAMPLE} class="text-sky-700 underline">{EXAMPLE}</a>
+			</p>
+		</div>
+	{:else if full}
+		{#await full}
 			<div class="flex h-full items-center justify-center text-zinc-500">読み込み中…</div>
 		{:then dataset}
 			{#key dataset}
@@ -156,12 +187,7 @@
 			</div>
 		{/await}
 	{:else}
-		<div class="flex h-full items-center justify-center text-zinc-500">
-			<p>
-				ユーザーを指定してください．例:
-				<a href={EXAMPLE} class="text-sky-700 underline">{EXAMPLE}</a>
-			</p>
-		</div>
+		<div class="flex h-full items-center justify-center text-zinc-500">読み込み中…</div>
 	{/if}
 
 	<div

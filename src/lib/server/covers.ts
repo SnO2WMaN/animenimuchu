@@ -1,111 +1,26 @@
+import type { Cover, CoverReport } from '#lib/graph-data.ts';
 import type { Dataset } from '#lib/types.ts';
-
-// --- AniList からの逆引き（MAL ID → カバー画像） ---
-
-const ANILIST_ENDPOINT = 'https://graphql.anilist.co';
-const BATCH_SIZE = 50;
-const BATCH_PARALLEL = 8;
-
-const ANILIST_QUERY = `query ($ids: [Int], $p: Int) {
-  Page(page: $p, perPage: ${BATCH_SIZE}) {
-    pageInfo { hasNextPage }
-    media(idMal_in: $ids, type: ANIME) { id idMal coverImage { medium } }
-  }
-}`;
-
-/** AniList 上の作品．画像が無くても AniList の ID は分かる（その場合 url は null）． */
-export type Cover = { url: string | null; anilistId: number };
 
 export type CoverCache = {
 	/** 有効期限内のものだけを返す．Map に無ければ未キャッシュ，値が null なら否定キャッシュ（AniList に作品が無い）． */
 	get(malIds: number[]): Promise<Map<number, Cover | null>>;
+	/** 無条件に上書きする． */
 	put(entries: { malId: number; cover: Cover | null }[]): Promise<void>;
-};
-
-type BatchResult = { ok: true; found: Map<number, Cover>; ids: number[] } | { ok: false };
-
-const fetchBatch = async (ids: number[], fetcher: typeof fetch): Promise<BatchResult> => {
-	try {
-		const res = await fetcher(ANILIST_ENDPOINT, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-			body: JSON.stringify({ query: ANILIST_QUERY, variables: { ids, p: 1 } })
-		});
-		// 429 でも Retry-After は待たない（Workers のリクエスト時間を食うため）．
-		if (!res.ok) return { ok: false };
-		const json = (await res.json()) as {
-			data?: {
-				Page?: {
-					media?: {
-						id: number;
-						idMal: number | null;
-						coverImage?: { medium?: string | null } | null;
-					}[];
-				};
-			};
-			errors?: unknown;
-		};
-		if (json.errors || !json.data?.Page || !Array.isArray(json.data.Page.media))
-			return { ok: false };
-		const found = new Map<number, Cover>();
-		for (const m of json.data.Page.media) {
-			if (typeof m.idMal === 'number' && typeof m.id === 'number')
-				found.set(m.idMal, { url: m.coverImage?.medium || null, anilistId: m.id });
-		}
-		return { ok: true, found, ids };
-	} catch {
-		return { ok: false };
-	}
-};
-
-/**
- * MAL ID から AniList の作品（ID とカバー画像）を一括で引く．
- * 作品はあるが画像が無いものは found に url: null で入る．
- * 失敗したバッチの ID は found にも missing にも入らない．
- */
-export const fetchCoversByMalId = async (
-	malIds: number[],
-	fetcher: typeof fetch = fetch
-): Promise<{ found: Map<number, Cover>; missing: number[]; failed: boolean }> => {
-	const unique = [...new Set(malIds)];
-	const batches: number[][] = [];
-	for (let i = 0; i < unique.length; i += BATCH_SIZE) batches.push(unique.slice(i, i + BATCH_SIZE));
-
-	const found = new Map<number, Cover>();
-	const missing: number[] = [];
-	let failed = false;
-
-	for (let i = 0; i < batches.length; i += BATCH_PARALLEL) {
-		const results = await Promise.all(
-			batches.slice(i, i + BATCH_PARALLEL).map((b) => fetchBatch(b, fetcher))
-		);
-		for (const [j, r] of results.entries()) {
-			if (!r.ok) {
-				failed = true;
-				continue;
-			}
-			// 成功したバッチで返ってこなかった ID は，AniList に作品が無い．
-			for (const id of batches[i + j]) {
-				const cover = r.found.get(id);
-				if (cover) found.set(id, cover);
-				else missing.push(id);
-			}
-		}
-	}
-	return { found, missing, failed };
+	/**
+	 * 先勝ち．画像つきの有効期限内の行が既にある malId は上書きしない．保存した件数を返す．
+	 * 行が無い・期限切れ・旧形式（anilist_id が NULL）・画像なしの行は上書きする．
+	 */
+	putIfAbsent(entries: { malId: number; cover: Cover }[]): Promise<number>;
 };
 
 const MAL_ID = /^anime:mal:(\d+)$/;
 
-/** MAL ID 付きで画像または AniList のリンクが無い作品に，AniList から逆引きしたサムネイルと作品ページを付ける．入力は変更しない． */
-export const fillCovers = async (
+/** D1 キャッシュだけを使い，MAL ID 付きで画像または AniList のリンクが無い作品を補う（AniList には接続しない）．入力は変更しない． */
+export const fillCoversFromCache = async (
 	dataset: Dataset,
-	options: {
-		cache?: CoverCache;
-		fetch?: typeof fetch;
-		waitUntil?: (p: Promise<unknown>) => void;
-	} = {}
+	cache: CoverCache | undefined
 ): Promise<Dataset> => {
+	if (!cache) return dataset;
 	const targets = new Set<number>();
 	for (const a of dataset.animes) {
 		if (a.imageUrl !== null && a.links.anilist !== null) continue;
@@ -114,44 +29,12 @@ export const fillCovers = async (
 	}
 	if (targets.size === 0) return dataset;
 
-	const covers = new Map<number, Cover | null>();
-	if (options.cache) {
-		try {
-			for (const [k, v] of await options.cache.get([...targets])) covers.set(k, v);
-		} catch (e) {
-			console.error('cover cache get failed', e);
-		}
-	}
-
-	const uncached = [...targets].filter((id) => !covers.has(id));
-	const entries: { malId: number; cover: Cover | null }[] = [];
-	if (uncached.length > 0) {
-		try {
-			const { found, missing } = await fetchCoversByMalId(uncached, options.fetch);
-			for (const [malId, cover] of found) {
-				covers.set(malId, cover);
-				entries.push({ malId, cover });
-			}
-			for (const malId of missing) {
-				covers.set(malId, null);
-				entries.push({ malId, cover: null });
-			}
-		} catch (e) {
-			console.error('cover fetch failed', e);
-		}
-	}
-
-	if (options.cache && entries.length > 0) {
-		const cache = options.cache;
-		const p = (async () => {
-			try {
-				await cache.put(entries);
-			} catch (e) {
-				console.error('cover cache put failed', e);
-			}
-		})();
-		if (options.waitUntil) options.waitUntil(p);
-		else await p;
+	let covers: Map<number, Cover | null>;
+	try {
+		covers = await cache.get([...targets]);
+	} catch (e) {
+		console.error('cover cache get failed', e);
+		return dataset;
 	}
 
 	return {
@@ -224,6 +107,22 @@ export const d1CoverCache = (db: D1Database, now: () => number = () => Date.now(
 				)
 			);
 		}
+	},
+	async putIfAbsent(entries) {
+		const t = now();
+		// 既存の行が，画像なし・旧形式・期限切れのときだけ上書きする．
+		const sql =
+			'INSERT INTO covers (mal_id, url, anilist_id, fetched_at) VALUES (?, ?, ?, ?) ON CONFLICT(mal_id) DO UPDATE SET url=excluded.url, anilist_id=excluded.anilist_id, fetched_at=excluded.fetched_at WHERE covers.url IS NULL OR covers.anilist_id IS NULL OR covers.fetched_at <= ?';
+		let saved = 0;
+		for (const part of chunks(entries)) {
+			const results = await db.batch(
+				part.map((e) =>
+					db.prepare(sql).bind(e.malId, e.cover.url, e.cover.anilistId, t, t - TTL_FOUND)
+				)
+			);
+			for (const r of results) saved += r.meta?.changes ?? 0;
+		}
+		return saved;
 	}
 });
 
@@ -431,4 +330,74 @@ export const buildRedirects = (base: string | undefined): string | null => {
 	const normalized = normalizePublicUrl(base);
 	if (normalized === null) return null;
 	return `/img/* ${normalized}/:splat 302\n`;
+};
+
+// --- ブラウザからのカバー画像の報告 ---
+
+const MAX_ID = 99_999_999;
+const REPORT_URL =
+	/^https:\/\/s4\.anilist\.co\/file\/anilistcdn\/media\/anime\/cover\/(?:small|medium|large|extraLarge)\/bx(\d+)-[A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp)$/;
+
+const isId = (v: unknown): v is number =>
+	typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= MAX_ID;
+
+/**
+ * `{ covers: [...] }` の本文を検証する．不正な要素は黙って捨て，構造が不正なら空配列．
+ * 同じ malId の重複は先勝ち．
+ */
+export const validateCoverReports = (input: unknown): CoverReport[] => {
+	if (typeof input !== 'object' || input === null) return [];
+	const covers = (input as { covers?: unknown }).covers;
+	if (!Array.isArray(covers)) return [];
+	const out: CoverReport[] = [];
+	const seen = new Set<number>();
+	for (const c of covers) {
+		if (typeof c !== 'object' || c === null) continue;
+		const { malId, anilistId, url } = c as Record<string, unknown>;
+		if (!isId(malId) || !isId(anilistId) || typeof url !== 'string') continue;
+		const m = REPORT_URL.exec(url);
+		if (!m || Number(m[1]) !== anilistId || seen.has(malId)) continue;
+		seen.add(malId);
+		out.push({ malId, anilistId, url });
+	}
+	return out;
+};
+
+/**
+ * 検証済みの報告を D1 に先勝ちで保存し，R2 に無いものを背景でミラーする．保存した件数を返す．
+ * ミラーのコピー元は，報告の URL ではなく，先勝ちで D1 に残っている URL を使う．
+ */
+export const acceptCoverReports = async (
+	reports: CoverReport[],
+	options: {
+		cache: CoverCache;
+		store?: CoverStore;
+		fetch?: typeof fetch;
+		waitUntil?: (p: Promise<unknown>) => void;
+		limit?: number;
+	}
+): Promise<number> => {
+	if (reports.length === 0) return 0;
+	const accepted = await options.cache.putIfAbsent(
+		reports.map((r) => ({ malId: r.malId, cover: { url: r.url, anilistId: r.anilistId } }))
+	);
+	if (options.store) {
+		const stored = await options.cache.get(reports.map((r) => r.malId));
+		const animes = [...stored].flatMap(([malId, cover]) =>
+			cover?.url
+				? [
+						{
+							id: `anime:mal:${malId}`,
+							title: '',
+							imageUrl: cover.url,
+							links: { annict: null, anilist: null, mal: null },
+							size: 0
+						}
+					]
+				: []
+		);
+		const keys = await listMirrored(options.store);
+		await scheduleMirror({ users: [], animes, statuses: [], errors: [] }, keys, options);
+	}
+	return accepted;
 };
