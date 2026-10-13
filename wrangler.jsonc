@@ -8,7 +8,7 @@
 		{
 			"binding": "DB",
 			"database_name": "animenimuchu",
-			"database_id": "00000000-0000-0000-0000-000000000000"
+			"database_id": "43cce07d-18cd-4b9c-b884-07194f73c8d9"
 		}
 	],
 	"r2_buckets": [{ "binding": "COVERS", "bucket_name": "animenimuchu-covers" }]
