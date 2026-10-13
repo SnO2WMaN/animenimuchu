@@ -223,7 +223,7 @@
 								bind:value={row.name}
 								data-row={row.id}
 								aria-label="ユーザー名"
-								placeholder={row.service === 'annict' ? 'tosuke' : 'sno2wman'}
+								placeholder="sno2wman"
 								onkeydown={(e) => {
 									if (e.key === 'Enter' && !e.isComposing) submit();
 								}}
