@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Cover, CoverReport } from '#lib/graph-data.ts';
 import type { AnimeLinks, Dataset } from '#lib/types.ts';
 import {
+	acceptCoverReports,
 	applyMirror,
 	buildRedirects,
 	d1CoverCache,
-	fillCovers,
+	fillCoversFromCache,
 	isMirrorPath,
 	mirrorKey,
 	mirrorUrl,
@@ -12,12 +14,12 @@ import {
 	r2CoverStore,
 	redirectTarget,
 	resetMirrorMemo,
-	type Cover,
+	validateCoverReports,
 	type CoverCache,
 	type CoverStore
 } from './covers.ts';
 
-// --- AniList からの逆引き ---
+// --- D1 キャッシュからの補完 ---
 
 const ds = (
 	animes: { id: string; imageUrl?: string | null; links?: Partial<AnimeLinks> }[]
@@ -34,204 +36,98 @@ const ds = (
 	errors: []
 });
 
-/** AniList を模す fake fetch．images に無い ID は返さない．AniList の ID は MAL ID + 1000．値が null なら画像なし． */
-const fakeFetch = (images: Record<number, string | null>, status = 200) => {
-	const calls: number[][] = [];
-	const f = vi.fn(async (_url: unknown, init?: RequestInit) => {
-		const ids = JSON.parse(init!.body as string).variables.ids as number[];
-		calls.push(ids);
-		if (status !== 200) return new Response('{}', { status });
-		const media = ids
-			.filter((id) => id in images)
-			.map((id) => ({
-				id: id + 1000,
-				idMal: id,
-				coverImage: images[id] === null ? null : { medium: images[id] }
-			}));
-		return Response.json({ data: { Page: { pageInfo: { hasNextPage: false }, media } } });
-	});
-	return { f: f as unknown as typeof fetch, calls };
-};
-
 const fakeCache = (initial: [number, Cover | null][] = []) => {
 	const store = new Map<number, Cover | null>(initial);
 	const put = vi.fn(async (entries: { malId: number; cover: Cover | null }[]) => {
 		for (const e of entries) store.set(e.malId, e.cover);
+	});
+	const putIfAbsent = vi.fn(async (entries: { malId: number; cover: Cover }[]) => {
+		let n = 0;
+		for (const e of entries) {
+			if (store.get(e.malId)?.url) continue;
+			store.set(e.malId, e.cover);
+			n++;
+		}
+		return n;
 	});
 	const get = vi.fn(async (ids: number[]) => {
 		const m = new Map<number, Cover | null>();
 		for (const id of ids) if (store.has(id)) m.set(id, store.get(id)!);
 		return m;
 	});
-	return { cache: { get, put } satisfies CoverCache, put, get };
+	return { cache: { get, put, putIfAbsent } satisfies CoverCache, put, putIfAbsent, get };
 };
 
-describe('fillCovers', () => {
-	it('sets imageUrl from AniList', async () => {
-		const { f } = fakeFetch({ 1: 'https://img/1.jpg' });
-		const out = await fillCovers(ds([{ id: 'anime:mal:1' }]), { fetch: f });
-		expect(out.animes[0].imageUrl).toBe('https://img/1.jpg');
+describe('fillCoversFromCache', () => {
+	it('sets imageUrl and the AniList link from the cache', async () => {
+		const { cache } = fakeCache([[1, { url: 'https://cached/1.jpg', anilistId: 1001 }]]);
+		const out = await fillCoversFromCache(ds([{ id: 'anime:mal:1' }]), cache);
+		expect(out.animes[0].imageUrl).toBe('https://cached/1.jpg');
+		expect(out.animes[0].links.anilist).toBe('https://anilist.co/anime/1001');
 	});
 
 	it('does not mutate the input', async () => {
 		const input = ds([{ id: 'anime:mal:1' }]);
-		const { f } = fakeFetch({ 1: 'https://img/1.jpg' });
-		await fillCovers(input, { fetch: f });
-		expect(input.animes[0].imageUrl).toBeNull();
-	});
-
-	it('does not look up animes that already have imageUrl and an AniList link', async () => {
-		const { f, calls } = fakeFetch({ 1: 'https://img/new.jpg' });
-		const out = await fillCovers(
-			ds([
-				{
-					id: 'anime:mal:1',
-					imageUrl: 'https://img/old.jpg',
-					links: { anilist: 'https://anilist.co/anime/5' }
-				}
-			]),
-			{
-				fetch: f
-			}
-		);
-		expect(calls).toEqual([]);
-		expect(out.animes[0].imageUrl).toBe('https://img/old.jpg');
-	});
-
-	it('does not fetch cache hits', async () => {
-		const { f, calls } = fakeFetch({ 2: 'https://img/2.jpg' });
 		const { cache } = fakeCache([[1, { url: 'https://cached/1.jpg', anilistId: 1001 }]]);
-		const out = await fillCovers(ds([{ id: 'anime:mal:1' }, { id: 'anime:mal:2' }]), {
-			fetch: f,
-			cache
-		});
-		expect(calls).toEqual([[2]]);
-		expect(out.animes.map((a) => a.imageUrl)).toEqual([
-			'https://cached/1.jpg',
-			'https://img/2.jpg'
-		]);
+		await fillCoversFromCache(input, cache);
+		expect(input.animes[0].imageUrl).toBeNull();
+		expect(input.animes[0].links.anilist).toBeNull();
 	});
 
-	it('treats a negative cache entry as a hit', async () => {
-		const { f, calls } = fakeFetch({ 1: 'https://img/1.jpg' });
-		const { cache, put } = fakeCache([[1, null]]);
-		const out = await fillCovers(ds([{ id: 'anime:mal:1' }]), { fetch: f, cache });
-		expect(calls).toEqual([]);
-		expect(put).not.toHaveBeenCalled();
-		expect(out.animes[0].imageUrl).toBeNull();
-	});
-
-	it('splits more than 50 ids into multiple requests', async () => {
-		const { f, calls } = fakeFetch({});
-		const animes = Array.from({ length: 120 }, (_, i) => ({ id: `anime:mal:${i + 1}` }));
-		await fillCovers(ds(animes), { fetch: f });
-		expect(calls.map((c) => c.length).sort((a, b) => b - a)).toEqual([50, 50, 20]);
-	});
-
-	it('does not cache failed batches and returns the graph intact', async () => {
-		const { f } = fakeFetch({}, 429);
-		const { cache, put } = fakeCache();
-		const input = ds([{ id: 'anime:mal:1' }, { id: 'anime:annict:5' }]);
-		const out = await fillCovers(input, { fetch: f, cache });
-		expect(put).not.toHaveBeenCalled();
-		expect(out.animes).toEqual(input.animes);
-	});
-
-	it('does not throw when fetch rejects', async () => {
-		const f = (async () => {
-			throw new Error('network');
-		}) as unknown as typeof fetch;
-		const input = ds([{ id: 'anime:mal:1' }]);
-		expect((await fillCovers(input, { fetch: f })).animes).toEqual(input.animes);
-	});
-
-	it('puts found urls and null for missing ids', async () => {
-		const { f } = fakeFetch({ 1: 'https://img/1.jpg' });
-		const { cache, put } = fakeCache();
-		await fillCovers(ds([{ id: 'anime:mal:1' }, { id: 'anime:mal:2' }]), { fetch: f, cache });
-		expect(put).toHaveBeenCalledTimes(1);
-		expect(put.mock.calls[0][0]).toEqual(
-			expect.arrayContaining([
-				{ malId: 1, cover: { url: 'https://img/1.jpg', anilistId: 1001 } },
-				{ malId: 2, cover: null }
-			])
-		);
-		expect(put.mock.calls[0][0]).toHaveLength(2);
-	});
-
-	it('ignores animes without a MAL id', async () => {
-		const { f, calls } = fakeFetch({});
-		const out = await fillCovers(ds([{ id: 'anime:annict:7' }]), { fetch: f });
-		expect(calls).toEqual([]);
-		expect(out.animes[0].imageUrl).toBeNull();
-	});
-
-	it('hands put to waitUntil without awaiting it', async () => {
-		const { f } = fakeFetch({ 1: 'https://img/1.jpg' });
-		let release!: () => void;
-		const gate = new Promise<void>((r) => (release = r));
-		const put = vi.fn(() => gate);
-		const cache: CoverCache = { get: async () => new Map(), put };
-		const waitUntil = vi.fn();
-		const out = await fillCovers(ds([{ id: 'anime:mal:1' }]), { fetch: f, cache, waitUntil });
-		expect(out.animes[0].imageUrl).toBe('https://img/1.jpg');
-		expect(put).toHaveBeenCalledTimes(1);
-		expect(waitUntil).toHaveBeenCalledTimes(1);
-		release();
-	});
-
-	it('swallows put errors', async () => {
-		const { f } = fakeFetch({ 1: 'https://img/1.jpg' });
-		const cache: CoverCache = {
-			get: async () => new Map(),
-			put: async () => {
-				throw new Error('d1 down');
+	it('does not touch animes that already have imageUrl and an AniList link', async () => {
+		const { cache, get } = fakeCache([[1, { url: 'https://cached/1.jpg', anilistId: 1 }]]);
+		const input = ds([
+			{
+				id: 'anime:mal:1',
+				imageUrl: 'https://img/old.jpg',
+				links: { anilist: 'https://anilist.co/anime/5' }
 			}
-		};
-		const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
-		const out = await fillCovers(ds([{ id: 'anime:mal:1' }]), { fetch: f, cache });
-		expect(out.animes[0].imageUrl).toBe('https://img/1.jpg');
-		spy.mockRestore();
+		]);
+		const out = await fillCoversFromCache(input, cache);
+		expect(get).not.toHaveBeenCalled();
+		expect(out).toBe(input);
 	});
 
-	it('sets links.anilist, and also when imageUrl already exists', async () => {
-		const { f } = fakeFetch({ 1: 'https://img/1.jpg', 2: 'https://img/2.jpg' });
-		const out = await fillCovers(
-			ds([{ id: 'anime:mal:1' }, { id: 'anime:mal:2', imageUrl: 'https://img/own.jpg' }]),
-			{ fetch: f }
+	it('keeps an existing imageUrl and fills only the link', async () => {
+		const { cache } = fakeCache([[1, { url: 'https://cached/1.jpg', anilistId: 1001 }]]);
+		const out = await fillCoversFromCache(
+			ds([{ id: 'anime:mal:1', imageUrl: 'https://img/own.jpg', links: { annict: 'a' } }]),
+			cache
 		);
-		expect(out.animes[0].links.anilist).toBe('https://anilist.co/anime/1001');
-		expect(out.animes[1].imageUrl).toBe('https://img/own.jpg');
-		expect(out.animes[1].links.anilist).toBe('https://anilist.co/anime/1002');
-	});
-
-	it('keeps other links untouched', async () => {
-		const { f } = fakeFetch({ 1: 'https://img/1.jpg' });
-		const out = await fillCovers(ds([{ id: 'anime:mal:1', links: { annict: 'a', mal: 'm' } }]), {
-			fetch: f
-		});
+		expect(out.animes[0].imageUrl).toBe('https://img/own.jpg');
 		expect(out.animes[0].links).toEqual({
 			annict: 'a',
-			mal: 'm',
+			mal: null,
 			anilist: 'https://anilist.co/anime/1001'
 		});
 	});
 
-	it('sets links.anilist even when AniList has no image', async () => {
-		const { f } = fakeFetch({ 1: null });
-		const { cache, put } = fakeCache();
-		const out = await fillCovers(ds([{ id: 'anime:mal:1' }]), { fetch: f, cache });
+	it('uses a cached imageless entry for the link only', async () => {
+		const { cache } = fakeCache([[1, { url: null, anilistId: 77 }]]);
+		const out = await fillCoversFromCache(ds([{ id: 'anime:mal:1' }]), cache);
 		expect(out.animes[0].imageUrl).toBeNull();
-		expect(out.animes[0].links.anilist).toBe('https://anilist.co/anime/1001');
-		expect(put.mock.calls[0][0]).toEqual([{ malId: 1, cover: { url: null, anilistId: 1001 } }]);
+		expect(out.animes[0].links.anilist).toBe('https://anilist.co/anime/77');
 	});
 
-	it('uses a cached imageless entry for the link without fetching', async () => {
-		const { f, calls } = fakeFetch({});
-		const { cache } = fakeCache([[1, { url: null, anilistId: 77 }]]);
-		const out = await fillCovers(ds([{ id: 'anime:mal:1' }]), { fetch: f, cache });
-		expect(calls).toEqual([]);
-		expect(out.animes[0].links.anilist).toBe('https://anilist.co/anime/77');
+	it('leaves negative cache entries, misses and non-MAL animes as they are', async () => {
+		const { cache, get } = fakeCache([[1, null]]);
+		const input = ds([{ id: 'anime:mal:1' }, { id: 'anime:mal:2' }, { id: 'anime:annict:7' }]);
+		const out = await fillCoversFromCache(input, cache);
+		expect(get.mock.calls[0][0]).toEqual([1, 2]);
+		expect(out.animes).toEqual(input.animes);
+	});
+
+	it('returns the input without a cache and swallows cache errors', async () => {
+		const input = ds([{ id: 'anime:mal:1' }]);
+		expect(await fillCoversFromCache(input, undefined)).toBe(input);
+		const cache: CoverCache = {
+			get: async () => {
+				throw new Error('d1 down');
+			},
+			put: async () => {},
+			putIfAbsent: async () => 0
+		};
+		expect(await fillCoversFromCache(input, cache)).toBe(input);
 	});
 });
 
@@ -325,6 +221,67 @@ describe('d1CoverCache', () => {
 });
 
 // --- R2 ミラー ---
+
+describe('d1CoverCache putIfAbsent', () => {
+	it('uses a conditional upsert that only overwrites imageless, legacy or expired rows', async () => {
+		const { db, batches } = fakeDb();
+		await d1CoverCache(db, () => NOW).putIfAbsent([
+			{ malId: 1, cover: { url: 'u', anilistId: 9 } }
+		]);
+		const stmt = batches[0][0];
+		expect(stmt.sql).toContain('ON CONFLICT(mal_id) DO UPDATE');
+		expect(stmt.sql).toContain(
+			'WHERE covers.url IS NULL OR covers.anilist_id IS NULL OR covers.fetched_at <= ?'
+		);
+		expect(stmt.params).toEqual([1, 'u', 9, NOW, NOW - 30 * DAY]);
+	});
+
+	it('returns the number of rows actually written', async () => {
+		const prepare = (sql: string) => ({ bind: (...params: unknown[]) => ({ sql, params }) });
+		const batch = async (stmts: { params: unknown[] }[]) =>
+			stmts.map((s) => ({ meta: { changes: s.params[0] === 2 ? 0 : 1 } }));
+		const db = { prepare, batch } as unknown as D1Database;
+		const n = await d1CoverCache(db, () => NOW).putIfAbsent([
+			{ malId: 1, cover: { url: 'a', anilistId: 1 } },
+			{ malId: 2, cover: { url: 'b', anilistId: 2 } },
+			{ malId: 3, cover: { url: 'c', anilistId: 3 } }
+		]);
+		expect(n).toBe(2);
+	});
+
+	// SQLite の ON CONFLICT ... WHERE と同じ規則を，メモリ上で再現して確認する．
+	it('first write wins within the TTL, and expired/legacy/imageless rows are replaced', async () => {
+		const rows = new Map<number, Row>([
+			[1, { mal_id: 1, url: 'old', anilist_id: 1, fetched_at: NOW - DAY }],
+			[2, { mal_id: 2, url: 'old', anilist_id: 2, fetched_at: NOW - 31 * DAY }],
+			[3, { mal_id: 3, url: 'old', anilist_id: null, fetched_at: NOW - DAY }],
+			[4, { mal_id: 4, url: null, anilist_id: 4, fetched_at: NOW - DAY }]
+		]);
+		const prepare = (_sql: string) => ({
+			bind: (...p: unknown[]) => ({ params: p })
+		});
+		const batch = async (stmts: { params: unknown[] }[]) =>
+			stmts.map(({ params: [id, url, aid, t, limit] }) => {
+				const r = rows.get(id as number);
+				if (r && !(r.url === null || r.anilist_id === null || r.fetched_at <= (limit as number)))
+					return { meta: { changes: 0 } };
+				rows.set(id as number, {
+					mal_id: id as number,
+					url: url as string,
+					anilist_id: aid as number,
+					fetched_at: t as number
+				});
+				return { meta: { changes: 1 } };
+			});
+		const db = { prepare, batch } as unknown as D1Database;
+		const n = await d1CoverCache(db, () => NOW).putIfAbsent(
+			[1, 2, 3, 4, 5].map((malId) => ({ malId, cover: { url: 'new', anilistId: malId } }))
+		);
+		expect(n).toBe(4);
+		expect(rows.get(1)?.url).toBe('old');
+		for (const id of [2, 3, 4, 5]) expect(rows.get(id)?.url).toBe('new');
+	});
+});
 
 const AL = (n: number) => `https://s4.anilist.co/file/${n}.jpg`;
 
@@ -603,5 +560,124 @@ describe('buildRedirects', () => {
 	it('不正・未設定は null', () => {
 		expect(buildRedirects('nope')).toBeNull();
 		expect(buildRedirects(undefined)).toBeNull();
+	});
+});
+
+// --- ブラウザからの報告 ---
+
+const cdn = (id: number, name = 'AbCd-_1', size = 'small', ext = 'jpg') =>
+	`https://s4.anilist.co/file/anilistcdn/media/anime/cover/${size}/bx${id}-${name}.${ext}`;
+
+const report = (malId: number, anilistId = malId + 1000): CoverReport => ({
+	malId,
+	anilistId,
+	url: cdn(anilistId)
+});
+
+describe('validateCoverReports', () => {
+	it('accepts valid reports of every size and extension', () => {
+		const covers = [
+			report(1),
+			{ malId: 2, anilistId: 2, url: cdn(2, 'x', 'medium', 'png') },
+			{ malId: 3, anilistId: 3, url: cdn(3, 'x', 'large', 'webp') },
+			{ malId: 4, anilistId: 4, url: cdn(4, 'x', 'extraLarge', 'jpeg') }
+		];
+		expect(validateCoverReports({ covers })).toEqual(covers);
+	});
+
+	it('silently drops invalid urls, hosts and extensions', () => {
+		const ok = report(1);
+		const bad = [
+			{ malId: 2, anilistId: 2, url: 'https://evil.example/x.jpg' },
+			{
+				malId: 3,
+				anilistId: 3,
+				url: cdn(3).replace('s4.anilist.co', 's4.anilist.co.evil.example')
+			},
+			{ malId: 4, anilistId: 4, url: cdn(4).replace('https', 'http') },
+			{ malId: 5, anilistId: 5, url: cdn(5, 'x', 'small', 'gif') },
+			{ malId: 6, anilistId: 6, url: cdn(6, 'x', 'huge') },
+			{ malId: 7, anilistId: 7, url: `${cdn(7)}?x=1` },
+			{ malId: 8, anilistId: 8, url: `${cdn(8)}/../x` },
+			{ malId: 9, anilistId: 9, url: cdn(9, 'a.b') },
+			{ malId: 10, anilistId: 10, url: 5 },
+			{ malId: 11, anilistId: 11 },
+			null,
+			'x'
+		];
+		expect(validateCoverReports({ covers: [...bad, ok] })).toEqual([ok]);
+	});
+
+	it('rejects a bx id that differs from anilistId', () => {
+		expect(validateCoverReports({ covers: [{ malId: 1, anilistId: 2, url: cdn(3) }] })).toEqual([]);
+	});
+
+	it('rejects out-of-range or non-integer ids', () => {
+		const mk = (malId: unknown, anilistId: unknown) => ({
+			malId,
+			anilistId,
+			url: cdn(Number(anilistId) || 1)
+		});
+		const covers = [
+			mk(0, 1),
+			mk(-1, 1),
+			mk(100_000_000, 1),
+			mk(1.5, 1),
+			mk('1', 1),
+			mk(1, 0),
+			mk(1, 100_000_000),
+			mk(2, 99_999_999),
+			mk(99_999_999, 1)
+		];
+		expect(validateCoverReports({ covers }).map((r) => r.malId)).toEqual([2, 99_999_999]);
+	});
+
+	it('keeps the first of duplicate malIds', () => {
+		const out = validateCoverReports({ covers: [report(1, 10), report(1, 20), report(2)] });
+		expect(out.map((r) => [r.malId, r.anilistId])).toEqual([
+			[1, 10],
+			[2, 1002]
+		]);
+	});
+
+	it('returns an empty array for malformed structures', () => {
+		for (const input of [null, undefined, 1, 'x', [], {}, { covers: 'x' }, { covers: {} }])
+			expect(validateCoverReports(input)).toEqual([]);
+	});
+});
+
+describe('acceptCoverReports', () => {
+	it('saves first-write-wins and mirrors from the stored url, not the reported one', async () => {
+		const { cache, putIfAbsent } = fakeCache([[1, { url: cdn(1001, 'first'), anilistId: 1001 }]]);
+		const { store, puts } = fakeStore();
+		const f = okFetch();
+		const accepted = await acceptCoverReports(
+			[{ malId: 1, anilistId: 1001, url: cdn(1001, 'second') }, report(2)],
+			{ cache, store, fetch: f }
+		);
+		expect(putIfAbsent).toHaveBeenCalledTimes(1);
+		expect(accepted).toBe(1);
+		const urls = (f as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+		expect(urls.sort()).toEqual([cdn(1001, 'first'), cdn(1002)].sort());
+		expect(puts.map((p) => p.key).sort()).toEqual(['mal/1.jpg', 'mal/2.jpg']);
+	});
+
+	it('mirrors up to 30 and skips already mirrored keys', async () => {
+		const { cache } = fakeCache();
+		const { store, puts } = fakeStore(['mal/1.jpg']);
+		const reports = Array.from({ length: 50 }, (_, i) => report(i + 1));
+		await acceptCoverReports(reports, { cache, store, fetch: okFetch() });
+		expect(puts).toHaveLength(30);
+		expect(puts.some((p) => p.key === 'mal/1.jpg')).toBe(false);
+	});
+
+	it('hands the copy to waitUntil and works without a store', async () => {
+		const { cache } = fakeCache();
+		const { store } = fakeStore();
+		const waitUntil = vi.fn();
+		await acceptCoverReports([report(1)], { cache, store, fetch: okFetch(), waitUntil });
+		expect(waitUntil).toHaveBeenCalledTimes(1);
+		await expect(acceptCoverReports([report(2)], { cache })).resolves.toBe(1);
+		await expect(acceptCoverReports([], { cache })).resolves.toBe(0);
 	});
 });

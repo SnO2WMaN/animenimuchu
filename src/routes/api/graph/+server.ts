@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { env, waitUntil } from 'cloudflare:workers';
+import { env } from 'cloudflare:workers';
 import { ANNICT_ACCESS_TOKEN } from '$app/env/private';
 import {
 	d1CoverCache,
@@ -16,12 +16,11 @@ import type { RequestHandler } from './$types';
  */
 const coverOptions = (): {
 	cache?: CoverCache;
-	waitUntil?: (p: Promise<unknown>) => void;
 } => {
 	try {
 		const db = env.DB;
 		if (!db) return {};
-		return { cache: d1CoverCache(db), waitUntil };
+		return { cache: d1CoverCache(db) };
 	} catch {
 		// プリレンダリング中など，env にアクセスできない場合．
 		return {};
@@ -32,17 +31,11 @@ const coverOptions = (): {
  * R2 バインディング（COVERS）から，画像のミラー設定を作る．
  * バインディングが無い環境では mirror なしになる．
  */
-const mirrorOptions = (): {
-	mirror?: { store: CoverStore };
-	waitUntil?: (p: Promise<unknown>) => void;
-} => {
+const mirrorOptions = (): { mirror?: { store: CoverStore } } => {
 	try {
 		const bucket = env.COVERS;
 		if (!bucket) return {};
-		return {
-			mirror: { store: r2CoverStore(bucket) },
-			waitUntil
-		};
+		return { mirror: { store: r2CoverStore(bucket) } };
 	} catch {
 		return {};
 	}
