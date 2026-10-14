@@ -13,7 +13,13 @@
 		annict: { label: 'Annict', badge: 'A', bg: 'bg-[#f06]' },
 		anilist: { label: 'AniList', badge: 'AL', bg: 'bg-[#3db4f2]' }
 	};
-	const STATUS_LABEL: Record<WatchStatus, string> = { WATCHING: '視聴中', WATCHED: '視聴済み' };
+	const STATUS_LABEL: Record<WatchStatus, string> = {
+		WATCHING: '視聴中',
+		WATCHED: '視聴済み',
+		PLANNING: '見たい'
+	};
+
+	const STATUS_ORDER: Record<WatchStatus, number> = { PLANNING: 0, WATCHED: 1, WATCHING: 2 };
 
 	// Annict のアイコンは直接参照できない（ホットリンク対策）ので，Graph と同じ同一オリジンのプロキシ経由にする．
 	const proxied = (url: string) => {
@@ -40,16 +46,19 @@
 			})
 			.sort(
 				(a, b) =>
-					Number(b.status === 'WATCHING') - Number(a.status === 'WATCHING') ||
-					a.user.name.localeCompare(b.user.name)
+					STATUS_ORDER[b.status] - STATUS_ORDER[a.status] || a.user.name.localeCompare(b.user.name)
 			);
 	});
+
+	const watching = $derived(watchers.filter((w) => w.status !== 'PLANNING'));
+	const planning = $derived(watchers.filter((w) => w.status === 'PLANNING'));
 
 	const userCounts = $derived.by(() => {
 		const mine = user ? dataset.statuses.filter((s) => s.userId === user.id) : [];
 		return {
 			watching: mine.filter((s) => s.status === 'WATCHING').length,
-			watched: mine.filter((s) => s.status === 'WATCHED').length
+			watched: mine.filter((s) => s.status === 'WATCHED').length,
+			planning: mine.filter((s) => s.status === 'PLANNING').length
 		};
 	});
 
@@ -83,6 +92,31 @@
 			aria-hidden="true">{[...name][0] ?? '?'}</span
 		>
 	{/if}
+{/snippet}
+
+{#snippet userList(list: typeof watchers)}
+	<ul class="flex flex-col gap-1.5">
+		{#each list as w (w.user.id)}
+			<li class="flex items-center gap-2">
+				{@render avatar(w.user.name, w.user.avatarUrl, 'size-5')}
+				<a
+					href={w.user.url}
+					target="_blank"
+					rel="noreferrer noopener"
+					class="min-w-0 flex-1 truncate hover:underline">{w.user.name}</a
+				>
+				<span
+					class="rounded px-1 text-[10px] font-bold text-white {SERVICE[w.user.service].bg}"
+					title={SERVICE[w.user.service].label}>{SERVICE[w.user.service].badge}</span
+				>
+				<span
+					class="rounded px-1.5 py-0.5 text-xs {w.status === 'WATCHING'
+						? 'bg-emerald-600 font-bold text-white'
+						: 'bg-zinc-200 text-zinc-600'}">{STATUS_LABEL[w.status]}</span
+				>
+			</li>
+		{/each}
+	</ul>
 {/snippet}
 
 {#if user || anime}
@@ -122,29 +156,14 @@
 				</div>
 			{/if}
 
-			<h3 class="mt-4 mb-1 font-semibold">観ている人（{watchers.length} 人）</h3>
-			<ul class="flex flex-col gap-1.5">
-				{#each watchers as w (w.user.id)}
-					<li class="flex items-center gap-2">
-						{@render avatar(w.user.name, w.user.avatarUrl, 'size-5')}
-						<a
-							href={w.user.url}
-							target="_blank"
-							rel="noreferrer noopener"
-							class="min-w-0 flex-1 truncate hover:underline">{w.user.name}</a
-						>
-						<span
-							class="rounded px-1 text-[10px] font-bold text-white {SERVICE[w.user.service].bg}"
-							title={SERVICE[w.user.service].label}>{SERVICE[w.user.service].badge}</span
-						>
-						<span
-							class="rounded px-1.5 py-0.5 text-xs {w.status === 'WATCHING'
-								? 'bg-emerald-600 font-bold text-white'
-								: 'bg-zinc-200 text-zinc-600'}">{STATUS_LABEL[w.status]}</span
-						>
-					</li>
-				{/each}
-			</ul>
+			{#if watching.length > 0}
+				<h3 class="mt-4 mb-1 font-semibold">観ている人（{watching.length} 人）</h3>
+				{@render userList(watching)}
+			{/if}
+			{#if planning.length > 0}
+				<h3 class="mt-4 mb-1 font-semibold">見たい人（{planning.length} 人）</h3>
+				{@render userList(planning)}
+			{/if}
 		{:else if user}
 			<div class="flex items-center gap-3">
 				{@render avatar(user.name, user.avatarUrl, 'size-12')}
@@ -165,7 +184,7 @@
 			</div>
 			<p class="mt-3">{user.size} 作品</p>
 			<p class="text-zinc-600">
-				視聴中 {userCounts.watching} · 視聴済み {userCounts.watched}
+				視聴中 {userCounts.watching} · 視聴済み {userCounts.watched} · 見たい {userCounts.planning}
 			</p>
 		{/if}
 	</section>

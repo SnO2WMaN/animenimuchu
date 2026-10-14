@@ -592,3 +592,38 @@ describe('anilistUsersOf', () => {
 		expect(anilistUsersOf([])).toEqual([]);
 	});
 });
+
+describe('mergeResults: PLANNING', () => {
+	const user = (id: string) => ({
+		id,
+		service: 'anilist' as const,
+		name: id,
+		avatarUrl: null,
+		url: ''
+	});
+	const anime = (id: string) => ({ id, title: id, imageUrl: null, links: noLinks });
+
+	it('より強い状態を優先し，size には数えない', () => {
+		const merged = mergeResults([
+			{
+				users: [user('u')],
+				animes: [anime('a'), anime('b')],
+				statuses: [
+					{ userId: 'u', animeId: 'a', status: 'PLANNING' },
+					{ userId: 'u', animeId: 'b', status: 'PLANNING' }
+				],
+				errors: []
+			},
+			{
+				users: [],
+				animes: [],
+				statuses: [{ userId: 'u', animeId: 'a', status: 'WATCHED' }],
+				errors: []
+			}
+		]);
+		expect(merged.statuses.find((s) => s.animeId === 'a')?.status).toBe('WATCHED');
+		expect(merged.statuses.find((s) => s.animeId === 'b')?.status).toBe('PLANNING');
+		expect(merged.animes.map((a) => a.size)).toEqual([1, 0]);
+		expect(merged.users[0].size).toBe(1);
+	});
+});

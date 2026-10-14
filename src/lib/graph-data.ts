@@ -1,14 +1,17 @@
 // ブラウザ・サーバ・vitest のどれでも動く（サーバ専用の import を含めない）．
 // AniList の API は，サーバの通信元がブロックされるため，ブラウザから直接呼ぶ．
-import type { Anime, Dataset, FetchResult, Status, User } from '#lib/types.ts';
+import type { Anime, Dataset, FetchResult, Status, User, WatchStatus } from '#lib/types.ts';
 
 // --- マージ ---
+
+const STATUS_RANK: Record<WatchStatus, number> = { PLANNING: 0, WATCHED: 1, WATCHING: 2 };
 
 /**
  * 複数サービスの取得結果を 1 つのグラフにまとめる．
  * 同じ作品は ID（主に MAL の ID）で同一視し，先に出てきた方のタイトルを使う．
  * 画像とリンクは，先に出てきたものが null なら後から来たもので補う（リンクはキーごと）．
- * 同じユーザー・作品の組に複数の状態があれば WATCHING を優先する．
+ * 同じユーザー・作品の組に複数の状態があれば WATCHING，WATCHED，PLANNING の順に優先する．
+ * サイズ（観ている人の数）には PLANNING を数えない．
  */
 export const mergeResults = (results: FetchResult[]): Dataset => {
 	const users = new Map<string, User>();
@@ -34,13 +37,14 @@ export const mergeResults = (results: FetchResult[]): Dataset => {
 		for (const s of r.statuses) {
 			const key = `${s.userId}\u0000${s.animeId}`;
 			const prev = statuses.get(key);
-			if (!prev || (prev.status === 'WATCHED' && s.status === 'WATCHING')) statuses.set(key, s);
+			if (!prev || STATUS_RANK[s.status] > STATUS_RANK[prev.status]) statuses.set(key, s);
 		}
 	}
 
 	const userSize = new Map<string, number>();
 	const animeSize = new Map<string, number>();
-	for (const { userId, animeId } of statuses.values()) {
+	for (const { userId, animeId, status } of statuses.values()) {
+		if (status === 'PLANNING') continue;
 		userSize.set(userId, (userSize.get(userId) ?? 0) + 1);
 		animeSize.set(animeId, (animeSize.get(animeId) ?? 0) + 1);
 	}
@@ -61,7 +65,7 @@ type MediaListCollection = {
 	user: { name: string; avatar: { medium: string | null } | null; siteUrl: string };
 	lists: {
 		entries: {
-			status: 'CURRENT' | 'REPEATING' | 'COMPLETED';
+			status: 'CURRENT' | 'REPEATING' | 'COMPLETED' | 'PLANNING';
 			media: {
 				id: number;
 				idMal: number | null;
@@ -76,7 +80,7 @@ type MediaListCollection = {
 // 1 人でも存在しないユーザーが混ざると全エイリアスが null になるので，ユーザーごとにリクエストを分ける．
 const ANILIST_QUERY = `
 	query($userName: String) {
-		MediaListCollection(userName: $userName, type: ANIME, status_in: [CURRENT, REPEATING, COMPLETED]) {
+		MediaListCollection(userName: $userName, type: ANIME, status_in: [CURRENT, REPEATING, COMPLETED, PLANNING]) {
 			user { name siteUrl avatar { medium } }
 			lists {
 				entries {
@@ -87,6 +91,16 @@ const ANILIST_QUERY = `
 		}
 	}
 `;
+
+const ANILIST_STATUS = {
+	CURRENT: 'WATCHING',
+	REPEATING: 'WATCHING',
+	COMPLETED: 'WATCHED',
+	PLANNING: 'PLANNING'
+} as const satisfies Record<
+	MediaListCollection['lists'][number]['entries'][number]['status'],
+	WatchStatus
+>;
 
 class AnilistError extends Error {}
 
@@ -164,7 +178,7 @@ export const fetchFromAnilist = async (
 				const s: Status = {
 					userId: user.id,
 					animeId: anime.id,
-					status: status === 'COMPLETED' ? 'WATCHED' : 'WATCHING'
+					status: ANILIST_STATUS[status]
 				};
 				result.animes.push(anime);
 				result.statuses.push(s);

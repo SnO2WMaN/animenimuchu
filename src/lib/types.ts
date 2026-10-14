@@ -1,6 +1,6 @@
 export type Service = 'annict' | 'anilist';
 
-export type WatchStatus = 'WATCHING' | 'WATCHED';
+export type WatchStatus = 'WATCHING' | 'WATCHED' | 'PLANNING';
 
 export type User = {
 	/** `user:<service>:<username>` */
