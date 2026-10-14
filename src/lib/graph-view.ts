@@ -248,6 +248,7 @@ export const highlightedAnimeIds = (
 
 	const watchedBy = new Map<string, Set<string>>();
 	for (const s of dataset.statuses) {
+		if (s.status === 'PLANNING') continue;
 		const set = watchedBy.get(s.animeId);
 		if (set) set.add(s.userId);
 		else watchedBy.set(s.animeId, new Set([s.userId]));

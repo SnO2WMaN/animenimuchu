@@ -81,6 +81,8 @@
 			});
 		});
 		dataset.animes.forEach((a) => {
+			// 「見たい」だけの作品（size 0）は，グラフには出さない．
+			if (a.size === 0) return;
 			const t = maxAnimeSize <= 1 ? 1 : (a.size - 1) / (maxAnimeSize - 1);
 			graph.addNode(a.id, {
 				kind: 'anime',
@@ -92,6 +94,7 @@
 			});
 		});
 		for (const s of dataset.statuses) {
+			if (s.status === 'PLANNING') continue;
 			if (!graph.hasNode(s.userId) || !graph.hasNode(s.animeId)) continue;
 			graph.addEdge(s.userId, s.animeId, {
 				status: s.status,

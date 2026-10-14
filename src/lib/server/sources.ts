@@ -7,6 +7,13 @@ const ANNICT_ENDPOINT = 'https://api.annict.com/graphql';
 // graphql-ruby は max_page_size を超える first を黙って切り詰めるので，大きめに指定してページングで取り切る．
 const PAGE_SIZE = 1000;
 
+// Annict の StatusState での名前．
+const ANNICT_STATE: Record<WatchStatus, string> = {
+	WATCHING: 'WATCHING',
+	WATCHED: 'WATCHED',
+	PLANNING: 'WANNA_WATCH'
+};
+
 const ANNICT_QUERY = `
 	query($username: String!, $state: StatusState!, $after: String) {
 		user(username: $username) {
@@ -49,7 +56,10 @@ const fetchWorks = async (
 				'Content-Type': 'application/json',
 				Accept: 'application/json'
 			},
-			body: JSON.stringify({ query: ANNICT_QUERY, variables: { username, state, after } })
+			body: JSON.stringify({
+				query: ANNICT_QUERY,
+				variables: { username, state: ANNICT_STATE[state], after }
+			})
 		});
 		if (!res.ok) throw new AnnictError(`HTTP ${res.status}`);
 
@@ -91,11 +101,12 @@ export const fetchFromAnnict = async (
 
 	const settled = await Promise.allSettled(
 		usernames.map(async (username) => {
-			const [watching, watched] = await Promise.all([
+			const [watching, watched, planning] = await Promise.all([
 				fetchWorks(username, 'WATCHING', token, fetcher),
-				fetchWorks(username, 'WATCHED', token, fetcher)
+				fetchWorks(username, 'WATCHED', token, fetcher),
+				fetchWorks(username, 'PLANNING', token, fetcher)
 			]);
-			return { username, watching, watched };
+			return { username, watching, watched, planning };
 		})
 	);
 
@@ -109,7 +120,7 @@ export const fetchFromAnnict = async (
 			return;
 		}
 
-		const { watching, watched } = s.value;
+		const { watching, watched, planning } = s.value;
 		const user: User = {
 			id: `user:annict:${watching.user.username.toLowerCase()}`,
 			service: 'annict',
@@ -121,7 +132,8 @@ export const fetchFromAnnict = async (
 
 		for (const [status, works] of [
 			['WATCHING', watching.works],
-			['WATCHED', watched.works]
+			['WATCHED', watched.works],
+			['PLANNING', planning.works]
 		] as const) {
 			for (const work of works) {
 				const animeId = work.malAnimeId
